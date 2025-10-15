@@ -1,0 +1,76 @@
+# --- Python bytecode / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environments ---
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+
+# --- Packages / build artifacts ---
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Tests / coverage ---
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.pyre/
+.pytype/
+.pylint.d/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Logs / temp ---
+logs/
+*.log
+*.tmp
+
+# --- Project-specific debug/output (images & dumps) ---
+debug/
+out/
+uploads/
+data/
+p2_cell_*.png
+p2_*.png
+*_debug.png
+
+# If you keep sample inputs, ignore large ones but allow a README
+samples/
+!samples/README.md
+
+# --- Env files (secrets) ---
+.env
+.env.*
+!.env.example
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# --- Tesseract assets (optional; unignore if you vendor these) ---
+tessdata/
