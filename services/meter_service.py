@@ -529,21 +529,14 @@ def _leading_one_rescue(bin_cell: np.ndarray, guess: str, conf: float) -> tuple[
     return guess, conf
 
 def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> dict:
-    """
-    Robust LCD meter read:
-      • Detects LCD/band, builds multiple ROIs (keep_right sweep)
-      • Dark-ink valley split + equal split; fuses 7-seg + binary-Tess + gray-Tess per slot
-      • 'Skinny-1' + leading-digit rescue to fix 1→0
-      • Whole-line tokens (proc/raw/dark) compete with slot result
-    """
     import time, re
     t0 = time.time()
 
-    # ---------- Detect & prep base materials ----------
-    lcd, band, _ = detect_and_crop(bgr, params)  # we'll rebuild ROI from band
+    # --------- 0) Detect once; rebuild ROIs from band ---------
+    lcd, band, _ = detect_and_crop(bgr, params)
 
+    # --------- A) ROI builder (fast) ---------
     def build_roi(keep_right: float):
-        """Return (roi_proc, roi_dark, roi_raw, glare_ratio, very_large)."""
         gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
         base_scale = params.scale if gray.shape[0] <= 500 else min(params.scale, 2.0)
         g = preprocess(gray, scale=base_scale)
@@ -553,16 +546,14 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         roi = g[:, x0:]
 
         roi_glare = float((roi > 245).mean())
-        very_large = h > 800
-
         roi_proc = roi.copy()
-        if very_large or roi_glare > 0.25:
+        if roi_glare > 0.25 or h > 800:
             roi_proc = suppress_glare_gray(roi_proc)
         roi_proc = tighten_roi(roi_proc)
-        roi_dark = binarize_dark_only(roi_proc)  # white=ink
-        return roi_proc, roi_dark, roi, roi_glare, very_large
+        roi_dark = binarize_dark_only(roi_proc)  # white = ink
+        return roi_proc, roi_dark, roi
 
-    # ---------- Local helpers ----------
+    # --------- B) Primary splitter: dark-ink valleys ---------
     def split_valleys_dark(bn: np.ndarray, slots: int) -> list[np.ndarray]:
         col = bn.sum(axis=0).astype(np.float32)
         if col.max() <= 0:
@@ -587,6 +578,7 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
             cells.append(bn[:, x0:x1])
         return cells if len(cells) == slots else split_equal(bn, slots)
 
+    # --------- C) Leftmost-‘1’ detection / rescue ---------
     def _count_holes(bin_img: np.ndarray) -> int:
         inv = 255 - bin_img
         cnts, hier = cv2.findContours(inv, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -597,37 +589,59 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
                 holes += 1
         return holes
 
+    def relaxed_one_sevenseg(cell_gray: np.ndarray) -> bool:
+        """Relaxed 7-seg check focused on '1' (b,c on; others off)."""
+        inv = 255 - cell_gray
+        bn = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        bn = cv2.morphologyEx(bn, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
+        ys, xs = np.where(bn > 0)
+        if len(xs) == 0: return False
+        x0, x1 = xs.min(), xs.max(); y0, y1 = ys.min(), ys.max()
+        bn = bn[y0:y1+1, x0:x1+1]
+        h, w = bn.shape[:2]
+        if h < 12 or w < 5: return False
+        boxes = seg_sample_boxes(h, w)  # a,b,c,d,e,f,g
+        on = []
+        for (yy0, yy1, xx0, xx1) in boxes:
+            roi = bn[yy0:yy1, xx0:xx1]
+            on.append((roi > 0).mean() if roi.size else 0.0)
+        a,b,c,d,e,f,g = on
+        return (b >= 0.22 and c >= 0.22 and a < 0.18 and d < 0.18 and e < 0.18 and f < 0.18 and g < 0.20)
+
     def skinny_one_fix(bin_cell: np.ndarray, digit: str, conf: float) -> tuple[str, float]:
-        """Generic '1' rescue on any slot if tall/skinny single bar dominates."""
+        """Tall/skinny, hole-less, center-dominant vertical bar ⇒ '1'."""
         h, w = bin_cell.shape[:2]
-        if h < 20 or w < 4: return digit, conf
-        aspect = w / float(h)
-        if aspect > 0.42: return digit, conf
-        if _count_holes(bin_cell) >= 1: return digit, conf
-        col = bin_cell.sum(axis=0).astype(np.float32) / 255.0
-        c0, c1 = int(0.40 * w), int(0.60 * w)
-        center = col[c0:c1].mean() if c1 > c0 else col.mean()
-        edges = np.r_[col[:int(0.25*w)], col[int(0.75*w):]].mean() if w >= 4 else 0.0
-        if center > max(3.0, 1.6*edges):
-            return "1", max(conf, 0.70)
+        ys, xs = np.where(bin_cell > 0)
+        if len(xs) == 0: return digit, conf
+        x0, x1 = xs.min(), xs.max(); y0, y1 = ys.min(), ys.max()
+        bw, bh = (x1 - x0 + 1), (y1 - y0 + 1)
+        if bh < 10 or bw < 3: return digit, conf
+        holes = _count_holes(bin_cell[y0:y1+1, x0:x1+1])
+        if holes > 0: return digit, conf
+        ar = bw / float(bh)
+        if ar > 0.55: return digit, conf
+        col = (bin_cell[:, x0:x1+1].sum(axis=0) / 255.0)
+        center = col[int(0.40*bw):int(0.60*bw)].mean() if bw > 6 else col.mean()
+        edges  = np.r_[col[:int(0.20*bw)], col[int(0.80*bw):]].mean() if bw > 10 else col.mean()
+        central_line = (bin_cell[:, int(x0 + 0.5*bw)] > 0).mean() if bw > 4 else 1.0
+        if center >= max(3.0, 1.4*edges) and central_line >= 0.82:
+            return "1", max(conf, 0.75)
         return digit, conf
 
-    def leading_one_rescue(bin_cell: np.ndarray, digit: str, conf: float) -> tuple[str, float]:
-        """Extra-conservative rescue for leftmost digit only."""
-        if digit not in ("", "0", "8"): return digit, conf
+    def leading_one_rescue(bin_cell: np.ndarray, gray_cell: np.ndarray, digit: str, conf: float) -> tuple[str, float]:
+        if digit not in ("", "0", "8"):  # only when plausible confusion
+            return digit, conf
+        if relaxed_one_sevenseg(gray_cell):
+            return "1", max(conf, 0.80)
         return skinny_one_fix(bin_cell, digit, conf)
 
+    # --------- D) Fused per-slot recognizer ---------
     def fuse_digit(cell_gray: np.ndarray, cell_bin: np.ndarray) -> tuple[str, float]:
-        # 7-seg vote
         d_seg = sevenseg_digit(cell_gray); c_seg = 60.0 if d_seg is not None else 0.0
-        # binary Tesseract (white=ink)
-        d_bin, c_bin = ocr_digit_from_binary(cell_bin)
-        # grayscale Tesseract (no seven-seg bias)
-        d_gra, c_gra = ocr_digit(cell_gray, prefer_sevenseg=False)
-        cand = [(d_seg or "", c_seg), (d_bin or "", c_bin), (d_gra or "", c_gra)]
-        d, c = max(cand, key=lambda z: z[1])
-        # generic skinny-1 repair when plausible
-        if d in ("", "0", "8"):
+        d_bin, c_bin = ocr_digit_from_binary(cell_bin)                 # white=ink
+        d_gra, c_gra = ocr_digit(cell_gray, prefer_sevenseg=False)     # gray OCR
+        d, c = max([(d_seg or "", c_seg), (d_bin or "", c_bin), (d_gra or "", c_gra)], key=lambda z: z[1])
+        if d in ("", "0", "8"):  # generic skinny-1 repair if still suspicious
             d, c = skinny_one_fix(cell_bin, d, c)
         return d, c
 
@@ -636,103 +650,75 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         base = 2 if len(ds) == target_len else (1 if abs(len(ds)-target_len) <= 1 else 0)
         return base + conf - pen
 
-    # ---------- Multi-ROI sweep (keep_right) & two splitters; keep best slot ----------
+    # --------- E) First pass on current keep_right ---------
     kr0 = clamp(params.keep_right, 0.62, 0.98)
-    KR_CANDS = sorted(set([kr0,
-                           clamp(kr0 + 0.04, 0.62, 0.98),
-                           clamp(kr0 - 0.06, 0.62, 0.98)]))
+    roi_proc, roi_dark, roi_raw = build_roi(kr0)
 
-    best_slot = {"digits": "", "conf": 0.0, "pen": 0, "kr": None, "how": ""}
-    saved_debug_cells = []
+    # split on dark valleys, map grayscale with same x-slices
+    cells_dark = split_valleys_dark(roi_dark, params.slots)
+    gray_cells, x_cur, total_w = [], 0, roi_dark.shape[1]
+    for bc in cells_dark:
+        w = bc.shape[1]
+        gray_cells.append(roi_proc[:, x_cur:x_cur + w if (x_cur + w) <= total_w else total_w]); x_cur += w
 
-    for kr in KR_CANDS:
-        roi_proc, roi_dark, roi_raw, _, _ = build_roi(kr)
+    slot_digits, slot_confs, dbg_cells = [], [], []
+    for i, (bcell, gcell) in enumerate(zip(cells_dark, gray_cells)):
+        d, cf = fuse_digit(gcell, bcell)
+        if i == 0:
+            d, cf = leading_one_rescue(bcell, gcell, d, cf)
+        slot_digits.append(d if d else "")
+        slot_confs.append(max(cf, 0.0))
+        if want_debug: dbg_cells.append(_png_b64(bcell))
 
-        # 1) valley split on dark
-        cells_dark = split_valleys_dark(roi_dark, params.slots)
-        # map to grayscale with same x-slices
-        gray_cells, x_cur, total_w = [], 0, roi_dark.shape[1]
-        for bc in cells_dark:
-            w = bc.shape[1]
-            gray_cells.append(roi_proc[:, x_cur:x_cur+w if (x_cur+w) <= total_w else total_w])
-            x_cur += w
+    ds = re.sub(r"\D", "", "".join(slot_digits))
+    conf_slot = 0.0
+    if ds:
+        if len(ds) < params.slots: ds = ds.zfill(params.slots)
+        elif len(ds) > params.slots: ds = ds[-params.slots:]
+        conf_slot = (sum(slot_confs)/len(slot_confs)/100.0) if slot_confs else 0.0
+    pen = _repetition_penalty(ds) if ds else 0
 
-        slot_digits, slot_confs, dbg_cells = [], [], []
-        for i, (bcell, gcell) in enumerate(zip(cells_dark, gray_cells)):
-            d, cf = fuse_digit(gcell, bcell)
-            if i == 0:  # leading digit rescue
-                d, cf = leading_one_rescue(bcell, d, cf)
-            slot_digits.append(d if d else "")
-            slot_confs.append(max(cf, 0.0))
-            if want_debug: dbg_cells.append(_png_b64(bcell))
+    # --------- F) Micro-rescan only for slot-0 when suspicious ---------
+    suspicious0 = (not slot_digits or slot_digits[0] in ("", "0", "8") or conf_slot < 0.45)
+    if suspicious0:
+        kr_alt = clamp(kr0 - 0.08, 0.62, 0.98)  # include more left margin
+        roi_proc2, roi_dark2, _ = build_roi(kr_alt)
+        cells_dark2 = split_valleys_dark(roi_dark2, params.slots)
+        if cells_dark2 and len(cells_dark2[0].shape) == 2:
+            w0 = cells_dark2[0].shape[1]
+            g0 = roi_proc2[:, :w0]
+            d0, c0 = fuse_digit(g0, cells_dark2[0])
+            d0, c0 = leading_one_rescue(cells_dark2[0], g0, d0, c0)
+            if d0:
+                slot_digits[0] = d0
+                ds = re.sub(r"\D", "", "".join(slot_digits))
+                if len(ds) < params.slots: ds = ds.zfill(params.slots)
+                elif len(ds) > params.slots: ds = ds[-params.slots:]
+                slot_confs[0] = max(slot_confs[0], c0)
+                conf_slot = (sum(slot_confs)/len(slot_confs)/100.0) if slot_confs else conf_slot
+                pen = _repetition_penalty(ds)
 
-        ds = re.sub(r"\D", "", "".join(slot_digits))
-        if ds:
-            if len(ds) < params.slots: ds = ds.zfill(params.slots)
-            elif len(ds) > params.slots: ds = ds[-params.slots:]
-            conf_slot = (sum(slot_confs)/len(slot_confs)/100.0) if slot_confs else 0.0
-        else:
-            conf_slot = 0.0
-        pen = _repetition_penalty(ds) if ds else 0
-
-        sc = score_slot_like(ds, conf_slot, pen, params.slots)
-        if sc > score_slot_like(best_slot["digits"], best_slot["conf"], best_slot["pen"], params.slots):
-            best_slot.update({"digits": ds, "conf": conf_slot, "pen": pen, "kr": kr, "how": "valley-dark"})
-            if want_debug: saved_debug_cells = dbg_cells
-
-        # 2) equal split on dark (cheap extra try)
-        cells_eq = split_equal(roi_dark, params.slots)
-        gray_cells2, x_cur, total_w = [], 0, roi_dark.shape[1]
-        for bc in cells_eq:
-            w = bc.shape[1]
-            gray_cells2.append(roi_proc[:, x_cur:x_cur+w if (x_cur+w) <= total_w else total_w])
-            x_cur += w
-
-        slot_digits2, slot_confs2 = [], []
-        for i, (bcell, gcell) in enumerate(zip(cells_eq, gray_cells2)):
-            d, cf = fuse_digit(gcell, bcell)
-            if i == 0:
-                d, cf = leading_one_rescue(bcell, d, cf)
-            slot_digits2.append(d if d else "")
-            slot_confs2.append(max(cf, 0.0))
-
-        ds2 = re.sub(r"\D", "", "".join(slot_digits2))
-        if ds2:
-            if len(ds2) < params.slots: ds2 = ds2.zfill(params.slots)
-            elif len(ds2) > params.slots: ds2 = ds2[-params.slots:]
-            conf_slot2 = (sum(slot_confs2)/len(slot_confs2)/100.0) if slot_confs2 else 0.0
-        else:
-            conf_slot2 = 0.0
-        pen2 = _repetition_penalty(ds2) if ds2 else 0
-
-        sc2 = score_slot_like(ds2, conf_slot2, pen2, params.slots)
-        if sc2 > score_slot_like(best_slot["digits"], best_slot["conf"], best_slot["pen"], params.slots):
-            best_slot.update({"digits": ds2, "conf": conf_slot2, "pen": pen2, "kr": kr, "how": "equal-dark"})
-            if want_debug: saved_debug_cells = []  # different split; omit cells to avoid confusion
-
-    # ---------- Whole-line tokens from ROI built with the winning keep_right ----------
-    kr_best = best_slot["kr"] if best_slot["kr"] is not None else kr0
-    roi_proc, roi_dark, roi_raw, _, _ = build_roi(kr_best)
+    # --------- G) Whole-line tokens (proc/raw/dark) on best ROI ---------
+    kr_best = clamp(kr0 - 0.08, 0.62, 0.98) if suspicious0 else kr0
+    roi_proc_best, roi_dark_best, roi_raw_best = build_roi(kr_best)
 
     tokens_all = []
-    for t in (ocr_whole_tokens(roi_proc) or []): t["src"] = "proc"; tokens_all.append(t)
-    for t in (ocr_whole_tokens(roi_raw)  or []): t["src"] = "raw";  tokens_all.append(t)
-    for t in (ocr_whole_tokens(roi_dark) or []): t["src"] = "dark"; tokens_all.append(t)
+    for t in (ocr_whole_tokens(roi_proc_best) or []): t["src"]="proc"; tokens_all.append(t)
+    for t in (ocr_whole_tokens(roi_raw_best)  or []): t["src"]="raw";  tokens_all.append(t)
+    for t in (ocr_whole_tokens(roi_dark_best) or []): t["src"]="dark"; tokens_all.append(t)
 
     target_len = params.slots
-
     def token_is_repetitive(digs: str) -> bool:
         return (len(digs) >= 3) and (len(set(digs)) == 1)
-
     def score_token(t):
-        len_diff = abs(len(t["digits"]) - target_len)
+        len_diff   = abs(len(t["digits"]) - target_len)
         len_bonus  = 2 if len_diff == 0 else (1 if len_diff == 1 else 0)
-        len_penalty = 3 if len_diff >= 2 else 0
+        len_penalty= 3 if len_diff >= 2 else 0
         dec_bonus  = 5 if (params.decimals and t["has_decimal"]) else (2 if t["has_decimal"] else 0)
-        big = (t["h_ratio"] >= 0.28 and t["w_ratio"] >= 0.22)
+        big        = (t["h_ratio"] >= 0.28 and t["w_ratio"] >= 0.22)
         size_bonus = 3 if big else (1 if (t["h_ratio"] >= 0.22 and t["w_ratio"] >= 0.18) else 0)
         if t.get("src") == "dark": size_bonus += 1
-        rep_pen = 4 if token_is_repetitive(t["digits"]) else 0
+        rep_pen    = 4 if token_is_repetitive(t["digits"]) else 0
         return dec_bonus + len_bonus + size_bonus + float(t["conf"]) - len_penalty - rep_pen
 
     best_tok = max(tokens_all, key=score_token) if tokens_all else None
@@ -742,39 +728,36 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
     digits_full = best_tok["digits"] if best_tok else ""
     has_decimal = bool(best_tok and best_tok["has_decimal"])
     c_full = float(best_tok["conf"]) if best_tok else 0.0
-    if best_tok and best_tok.get("src") == "dark":
-        c_full += 0.05  # tiny bonus for dark-ROI token
+    if best_tok and best_tok.get("src") == "dark": c_full += 0.05
 
-    # ---------- Decision: slot vs whole-line ----------
-    score_best_slot = score_slot_like(best_slot["digits"], best_slot["conf"], best_slot["pen"], params.slots)
-    len_mismatch = abs(len(digits_full) - params.slots)
+    # --------- H) Decide best: slot vs whole-line ----------
+    score_slot = (2 if ds and len(ds) == target_len else (1 if ds and abs(len(ds)-target_len)<=1 else 0)) + conf_slot - pen
+    len_mismatch = abs(len(digits_full) - target_len)
     score_full = (5 if has_decimal else 0) + c_full - (3 if len_mismatch >= 2 else 0)
 
-    choose_full = (score_full >= score_best_slot) and bool(digits_full)
-    if (not choose_full) and digits_full and (best_slot["digits"] in ("0000","8888") or best_slot["pen"] >= 3):
-        if len_mismatch <= 1:
-            choose_full = True
+    choose_full = (score_full >= score_slot) and bool(digits_full)
+    if (not choose_full) and digits_full and (ds in ("0000","8888") or pen >= 3):
+        if len_mismatch <= 1: choose_full = True
 
-    chosen_digits_raw = digits_full if choose_full else best_slot["digits"]
+    chosen_digits_raw = digits_full if choose_full else ds
     value = _format_value(chosen_digits_raw, params.slots, params.decimals,
                           (best_tok["text"] if (choose_full and best_tok) else None))
-    conf = c_full if choose_full else best_slot["conf"]
+    conf = c_full if choose_full else conf_slot
     source = "full" if choose_full else "slot"
 
-    # ---------- Quality & debug ----------
-    metric_cells = []
+    # --------- I) Quality & debug ----------
     try:
-        metric_cells = split_valleys_dark(roi_dark, params.slots)
+        metric_cells = split_valleys_dark(roi_dark_best, params.slots)
     except Exception:
-        pass
-    q = assess_quality(bgr, lcd, roi_proc, metric_cells)
+        metric_cells = []
+    q = assess_quality(bgr, lcd, roi_proc_best, metric_cells)
 
     out = {
         "value": value,
         "digits": re.sub(r"\D", "", chosen_digits_raw or ""),
         "confidence": round(float(conf), 3),
         "confidence_source": source,
-        "timing_ms": int((time.time() - t0) * 1000),
+        "timing_ms": int((time.time()-t0)*1000),
         "quality": {"ok": q.ok, "issues": q.issues, "metrics": q.metrics},
         "params": {
             "slots": params.slots, "keep_right": params.keep_right,
@@ -787,7 +770,7 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         out["debug"] = {
             "lcd_b64": _png_b64(lcd),
             "band_b64": _png_b64(band),
-            "roi_b64": _png_b64(roi_proc),
-            "cells_b64": saved_debug_cells
+            "roi_b64": _png_b64(roi_proc_best),
+            "cells_b64": [ _png_b64(c) for c in metric_cells[:params.slots] ]
         }
     return out
