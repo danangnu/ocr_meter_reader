@@ -441,8 +441,10 @@ def _repetition_penalty(digits: str) -> int:
     from collections import Counter
     c = Counter(digits)
     ratio = max(c.values()) / len(digits)
-    if ratio >= 0.75 and c.most_common(1)[0][0] in "80":
-        return 4
+    top = c.most_common(1)[0][0]
+    # penalize heavy repetition; extra-strong for 8/0/6 (typical glare/merge failures)
+    if ratio >= 0.75 and top in "806":
+        return 5
     if ratio >= 0.75:
         return 3
     return 0
@@ -450,15 +452,21 @@ def _repetition_penalty(digits: str) -> int:
 # --- Keep only the darkest strokes (ignore bright glare) ---
 def binarize_dark_only(gray: np.ndarray) -> np.ndarray:
     bg = cv2.GaussianBlur(gray, (0, 0), 5.0)
-    ink = cv2.subtract(bg, gray)              # darker than local bg
-    T = float(np.percentile(ink, 60))         # was 75 → keep more strokes
-    T = max(8.0, T)
+    ink = cv2.subtract(bg, gray)
+    T = float(np.percentile(ink, 50))   # was 60
+    T = max(6.0, T)                     # was 8.0
     bn = cv2.threshold(ink, T, 255, cv2.THRESH_BINARY)[1]
     bn = cv2.morphologyEx(bn, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), 1)
-    return bn  # white=ink
+    return bn
 
 def ocr_digit_from_binary(bn: np.ndarray) -> tuple[str, float]:
     def _one(mask):
+        # ---- NEW: treat near-empty glyphs as "no digit" ----
+        ink_ratio = float(mask.sum() / 255.0) / max(1.0, (mask.shape[0] * mask.shape[1]))
+        if ink_ratio < 0.04:
+            return "", 0.0
+        # -----------------------------------------------
+
         ys, xs = np.where(mask > 0)
         if len(xs) and len(ys):
             x0,x1 = max(0, xs.min()-2), min(mask.shape[1]-1, xs.max()+2)
@@ -476,7 +484,6 @@ def ocr_digit_from_binary(bn: np.ndarray) -> tuple[str, float]:
         return best, (conf if conf >= 0 else 0.0)
 
     a, ca = _one(bn)
-    # try light erosion to break over-connected segments that look like “8”
     er = cv2.morphologyEx(bn, cv2.MORPH_ERODE, np.ones((2,2), np.uint8), 1)
     b, cb = _one(er)
     return (a, ca) if ca >= cb else (b, cb)
@@ -572,7 +579,60 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
 
     lcd, band, _ = detect_and_crop(bgr, params)
 
+<<<<<<< Updated upstream
     # ---------- ROI builder ----------
+=======
+    # ---------- small helpers ----------
+    def _leading_zero_penalty(ds: str, decimals: Optional[int]) -> int:
+        if not ds:
+            return 0
+        if ds.startswith("000"):        # very padded
+            return 3
+        if ds.startswith("00"):
+            return 2 if decimals else 1
+        return 0
+
+    def _normalize_slots(ds_raw: str, slots: int, conf_slot: float, decimals: Optional[int]) -> str:
+        """
+        Keep slot digits as-is if weak. Only pad when confidence is decent.
+        If decimals is set, never pad beyond (decimals+1) when weak -> avoid "000.x".
+        """
+        d = re.sub(r"\D", "", ds_raw or "")
+        if not d:
+            return ""
+        if conf_slot < 0.45:
+            if decimals is not None:
+                need = max(1, decimals + 1)
+                if len(d) < need:
+                    # minimally make it renderable as a decimal, but don't "000" pad
+                    d = d.zfill(need)
+                else:
+                    # trim from left if too long
+                    d = d[-max(need, len(d)):]
+                return d
+            # no decimals → keep as-is (no force zfill)
+            return d[-min(len(d), slots):]
+
+        # strong enough -> enforce target slots
+        if len(d) < slots:
+            d = d.zfill(slots)
+        elif len(d) > slots:
+            d = d[-slots:]
+        return d
+
+    def _format_value_from_digits(digs: str, decimals: Optional[int], fallback_text: Optional[str]) -> str:
+        d = re.sub(r"\D", "", digs or "")
+        if decimals is not None:
+            need = max(1, decimals + 1)
+            d = d.zfill(need) if len(d) < need else d[-max(need, len(d)):]
+            return (d[:-decimals] + "." + d[-decimals:]) if decimals > 0 else d
+        if fallback_text:
+            m = re.search(r"\d+\.\d+", fallback_text)
+            if m:
+                return m.group(0)
+        return d
+
+>>>>>>> Stashed changes
     def build_roi(keep_right: float):
         gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
         base_scale = params.scale if gray.shape[0] <= 500 else min(params.scale, 2.0)
@@ -589,6 +649,7 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         roi_proc = tighten_roi(roi_proc)
         roi_dark = binarize_dark_only(roi_proc)  # white=ink
         return roi_proc, roi_dark, roi_raw
+<<<<<<< Updated upstream
 
     # ---------- helpers ----------
     def pad_cell(img: np.ndarray, frac: float = 0.08) -> np.ndarray:
@@ -599,6 +660,13 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
     def split_valleys_dark(bn: np.ndarray, slots: int) -> list[np.ndarray]:
         col = bn.sum(axis=0).astype(np.float32)
         if col.max() <= 0: return split_equal(bn, slots)
+=======
+
+    def split_valleys_dark(bn: np.ndarray, slots: int) -> list[np.ndarray]:
+        col = bn.sum(axis=0).astype(np.float32)
+        if col.max() <= 0:
+            return split_equal(bn, slots)
+>>>>>>> Stashed changes
         sm = cv2.blur(col.reshape(1,-1), (1,25)).ravel()
         W = len(sm); approx = max(6, W // slots)
         cuts = []
@@ -614,11 +682,19 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         cells = []
         for i in range(slots):
             x0, x1 = xs[i], xs[i+1]
+<<<<<<< Updated upstream
             if x1 - x0 < 6: x0 = max(0, x0-3); x1 = min(W, x1+3)
             cells.append(bn[:, x0:x1])
         return cells if len(cells) == slots else split_equal(bn, slots)
 
     # ---- segment strengths & template voting ----
+=======
+            if x1 - x0 < 6:
+                x0 = max(0, x0-3); x1 = min(W, x1+3)
+            cells.append(bn[:, x0:x1])
+        return cells if len(cells) == slots else split_equal(bn, slots)
+
+>>>>>>> Stashed changes
     def seg_strengths(gray_cell: np.ndarray) -> np.ndarray:
         best = np.zeros(7, dtype=np.float32)  # a..g
         for inv in (True, False):
@@ -654,6 +730,7 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
     }
     WEIGHTS = np.array([1.0, 1.1, 1.1, 1.0, 1.0, 1.25, 1.20], dtype=np.float32)
 
+<<<<<<< Updated upstream
     def seg_best_vs_second(gray_cell: np.ndarray) -> tuple[str, float]:
         s = seg_strengths(gray_cell)
         scores = []
@@ -702,19 +779,38 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
         return 0.45*c_width + 0.30*c_height + 0.25*c_center
 
     # ---------- Per-slot fused OCR ----------
+=======
+    def seg_classify(gray_cell: np.ndarray) -> tuple[str, float]:
+        s = seg_strengths(gray_cell)
+        best_digit, best_score = "", 1e9
+        for d, t in TEMPLATES.items():
+            err = WEIGHTS * ((t - s) ** 2)
+            score = float(err.sum())
+            if score < best_score:
+                best_score, best_digit = score, d
+        conf = max(0.0, min(1.0, 1.0 - best_score / 1.6))
+        return best_digit, conf
+
+>>>>>>> Stashed changes
     def fuse_digit(cell_gray: np.ndarray, cell_bin: np.ndarray) -> tuple[str, float]:
         d_seg = sevenseg_digit(cell_gray); c_seg = 60.0 if d_seg is not None else 0.0
         d_bin, c_bin = ocr_digit_from_binary(cell_bin)
         d_gra, c_gra = ocr_digit(cell_gray, prefer_sevenseg=False)
         cand = [(d_seg or "", c_seg), (d_bin or "", c_bin), (d_gra or "", c_gra)]
         d_best, c_best = max(cand, key=lambda z: z[1])
+<<<<<<< Updated upstream
         return d_best, c_best  # ~0..100
+=======
+        return d_best, c_best  # conf ~0..100
+>>>>>>> Stashed changes
 
-    def score_slot_like(ds: str, conf: float, pen: int, target_len: int) -> float:
-        if not ds: return -999.0
+    def score_slot_like(ds: str, conf: float, target_len: int, decimals: Optional[int]) -> float:
+        if not ds:
+            return -999.0
         base = 2 if len(ds) == target_len else (1 if abs(len(ds)-target_len) <= 1 else 0)
-        return base + conf - pen
+        return base + conf - _leading_zero_penalty(ds, decimals)
 
+<<<<<<< Updated upstream
     # ---------- Run one KR ----------
     def run_for_kr(kr: float):
         roi_proc, roi_dark, _ = build_roi(kr)
@@ -832,10 +928,87 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
     sweep = sorted(set([kr0] + [clamp(kr0-d,0.50,0.98) for d in (0.04,0.08,0.12,0.16,0.20,0.24)]))
     results = [run_for_kr(kr) for kr in sweep]
     best = max(results, key=lambda r: (r["left_score"] >= 0.40, round(r["left_score"],3), r["score"]))
+=======
+    # ---------- KR sweep (wider) ----------
+    kr0 = clamp(params.keep_right, 0.50, 0.98)
+    sweep = sorted(set([
+        kr0,
+        clamp(kr0-0.06, 0.50, 0.98),
+        clamp(kr0-0.12, 0.50, 0.98),
+        clamp(kr0-0.18, 0.50, 0.98),
+        clamp(kr0-0.24, 0.50, 0.98),
+        clamp(kr0-0.30, 0.50, 0.98),
+    ]))
+
+    def run_for_kr(kr: float):
+        roi_proc, roi_dark, _ = build_roi(kr)
+        cells_dark = split_valleys_dark(roi_dark, params.slots)
+
+        # map grayscale cells to same spans
+        gray_cells, x_cur, total_w = [], 0, roi_dark.shape[1]
+        for bc in cells_dark:
+            w = bc.shape[1]
+            gray_cells.append(roi_proc[:, x_cur:min(total_w, x_cur + w)])
+            x_cur += w
+
+        # OCR per-slot
+        slot_digits, slot_confs = [], []
+        for bcell, gcell in zip(cells_dark, gray_cells):
+            d, cf = fuse_digit(gcell, bcell)
+            slot_digits.append(d if d else "")
+            slot_confs.append(max(cf, 0.0))
+
+        ds_raw = "".join(slot_digits)
+        conf_slot = (sum(slot_confs)/len(slot_confs)/100.0) if slot_confs else 0.0
+        ds = _normalize_slots(ds_raw, params.slots, conf_slot, params.decimals)
+
+        score = score_slot_like(ds, conf_slot, params.slots, params.decimals)
+        return {
+            "kr": kr, "roi_proc": roi_proc, "roi_dark": roi_dark,
+            "cells_dark": cells_dark, "gray_cells": gray_cells,
+            "slot_digits": slot_digits, "slot_confs": slot_confs,
+            "ds": ds, "conf_slot": conf_slot, "score": score
+        }
+
+    results = [run_for_kr(kr) for kr in sweep]
+    best = max(results, key=lambda r: r["score"])
+
+    # ---------- whole-line tokens (proc + dark + extra PSMs) ----------
+    roi_proc_best, roi_dark_best = best["roi_proc"], best["roi_dark"]
+    tokens_all = []
+    for img in (roi_proc_best, roi_dark_best):
+        for psm in (6,7,8,11,13):
+            bn = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
+            cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789."
+            from pytesseract import Output
+            d = pytesseract.image_to_data(bn, config=cfg, output_type=Output.DICT)
+            H,W = img.shape[:2]
+            n = len(d.get("text", []))
+            for i in range(n):
+                t = (d["text"][i] or "").strip()
+                if not re.fullmatch(r"[0-9.]+", t): 
+                    continue
+                try: conf = float(d["conf"][i]) / 100.0
+                except: conf = 0.0
+                w = int(d["width"][i] or 0); h = int(d["height"][i] or 0)
+                if w<=0 or h<=0: 
+                    continue
+                tokens_all.append({
+                    "text": t, "digits": re.sub(r"\D","", t),
+                    "conf": conf, "has_decimal": ("." in t),
+                    "h_ratio": h/float(H), "w_ratio": w/float(W)
+                })
+
+    def _plausible_token(tok, target_len: int) -> bool:
+        size_ok = (tok["h_ratio"] >= 0.18 and tok["w_ratio"] >= 0.16)
+        len_ok  = (abs(len(tok["digits"]) - target_len) <= 1)
+        return size_ok and len_ok
+>>>>>>> Stashed changes
 
     # ---------- Whole-line tokens (prefer clean decimal) ----------
     tokens_all = ocr_whole_tokens(best["roi_proc"]) + ocr_whole_tokens(best["roi_dark"])
     target_len = params.slots
+<<<<<<< Updated upstream
     tok_strong = best_decimal_token(tokens_all, target_len)
 
     # Decide slot vs whole-line
@@ -857,6 +1030,46 @@ def read_from_bgr(bgr: np.ndarray, params: Params, want_debug: bool = False) -> 
     value = _format_value(
         chosen_digits_raw, params.slots, params.decimals,
         (tok_strong["text"] if (choose_full and tok_strong) else None)
+=======
+    def token_score(t):
+        len_diff = abs(len(t["digits"]) - target_len)
+        len_bonus = 2 if len_diff==0 else (1 if len_diff==1 else 0)
+        len_pen   = 3 if len_diff>=2 else 0
+        dec_bonus = 8 if (params.decimals and t["has_decimal"]) else (3 if t["has_decimal"] else 0)
+        big = (t["h_ratio"]>=0.28 and t["w_ratio"]>=0.22)
+        size_bonus = 3 if big else (1 if (t["h_ratio"]>=0.22 and t["w_ratio"]>=0.18) else 0)
+        rep_pen = 4 if (len(t["digits"])>=3 and len(set(t["digits"]))==1) else 0
+        return dec_bonus + len_bonus + size_bonus + float(t["conf"]) - len_pen - rep_pen
+
+    best_tok = max(tokens_all, key=token_score) if tokens_all else None
+    if best_tok and not _plausible_token(best_tok, target_len):
+        best_tok = None
+
+    digits_full = best_tok["digits"] if best_tok else ""
+    has_decimal = bool(best_tok and best_tok["has_decimal"])
+    c_full = float(best_tok["conf"]) if best_tok else 0.0
+
+    # ---------- choose slot vs full ----------
+    ds, conf_slot = best["ds"], best["conf_slot"]
+    score_slot = score_slot_like(ds, conf_slot, params.slots, params.decimals)
+    len_mismatch = abs(len(digits_full) - target_len)
+    score_full = (10 if has_decimal else 0) + c_full - (3 if len_mismatch >= 2 else 0)
+
+    slot_looks_padded = bool(ds and ds.startswith("00") and conf_slot < 0.45)
+    slot_weak = (conf_slot < 0.45)
+
+    choose_full = False
+    if best_tok:
+        if has_decimal and (slot_looks_padded or slot_weak):
+            choose_full = True
+        else:
+            choose_full = (score_full >= score_slot)
+
+    chosen_digits_raw = digits_full if choose_full else ds
+    value = _format_value_from_digits(
+        chosen_digits_raw, params.decimals,
+        (best_tok["text"] if (choose_full and best_tok) else None)
+>>>>>>> Stashed changes
     )
     conf = c_full if choose_full else conf_slot
     source = "full" if choose_full else "slot"
